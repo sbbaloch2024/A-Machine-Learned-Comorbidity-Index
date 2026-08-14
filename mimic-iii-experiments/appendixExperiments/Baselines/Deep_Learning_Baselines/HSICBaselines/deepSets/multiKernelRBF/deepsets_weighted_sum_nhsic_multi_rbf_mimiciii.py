@@ -1,0 +1,1020 @@
+"""
+DeepSets (Masked Sum Pooling + LayerNorm) + NHSIC Multi-Task Clinical Outcome Predictor
+=========================================================================================
+
+Overview
+--------
+This script is a variant of the DeepSets + NHSIC pipeline that uses masked sum
+pooling with LayerNorm as the set aggregation mechanism. Unlike the masked mean
+variant (which divides by token count) or the gated variant (which uses learned
+sigmoid weights), this variant sums token representations directly over non-PAD
+positions before applying LayerNorm — making the pooled representation sensitive
+to the total number of codes present. The two-stage NHSIC training strategy,
+weight derivation, score orientation, and evaluation protocol are identical to
+the other DeepSets variants.
+
+Pipeline Flow
+-------------
+1.  Parse --data_root (path to final_datasets) and --validity_mode
+    ("taskwise" or "intersection") controlling which admissions are valid
+    per NHSIC objective.
+2.  Load train/val/test admission CSVs and diagnosis ICD-9 CSV.gz files in
+    chunks (2M rows). Build a TRAIN-only vocabulary of 4-char ICD prefix tokens
+    (plus PAD and UNK tokens).
+3.  Build hadm_id → token-list mappings for each split, capped at 256 codes
+    per admission in file-encounter order.
+4.  Construct AdmissionsSetDataset instances with per-target label matrices Y
+    (N, T) and validity masks M (N, T); long_stay validity is driven by
+    long_stay_defined.
+5.  Estimate sigma_base for the multi-RBF kernel by computing the median
+    pairwise absolute score difference over up to 5000 TRAIN predictions
+    from the randomly initialized model.
+6.  Stage 1 — Per-target single-task NHSIC training (10 epochs, AdamW, LR=1e-3):
+        - Skip targets that are single-class or have no valid labels on TRAIN.
+        - Select best checkpoint by highest per-task VAL NHSIC (subsampled).
+        - Record best VAL NHSIC per task for weight derivation.
+7.  Derive per-task weights from Stage-1 VAL NHSIC scores:
+        weight_t = clip((max_score / max(score_t, ε))^0.25, 1/3, 3)
+    then normalize active weights to mean 1; skipped tasks receive weight 0.
+8.  Stage 2 — Weighted multi-task NHSIC training (10 epochs, AdamW, LR=1e-3):
+        - Objective is the weighted sum of per-task NHSIC values.
+        - Select best checkpoint by highest weighted VAL NHSIC sum.
+        - Use a fresh model and re-estimated sigma_base.
+9.  Orient the final score's sign using VAL Pearson correlation against mortality
+    (flip so that higher score implies higher risk).
+10. Evaluate on TEST: per-task NHSIC (subsampled),
+    Distance Correlation, and Mutual Information.
+
+Architecture: DeepSetsSingleScalar (Masked Sum Pooling)
+--------------------------------------------------------
+- Embedding layer (vocab_size → EMB_DIM=128)
+- Per-token phi network: Linear → ReLU → Linear → ReLU
+- PAD tokens zeroed out via keep mask before pooling
+- Masked sum pool: H.sum(dim=1) over non-PAD positions (no count normalization)
+- LayerNorm on the summed representation
+- rho network: Linear → ReLU → Linear → ReLU → Linear(1) → scalar score
+
+Difference from Other DeepSets Variants
+-----------------------------------------
+The mean-pooling variant divides the sum by valid token count, making it
+count-invariant. The gated variant learns per-token importance weights. This
+variant uses raw sum pooling — the pooled vector magnitude grows with the number
+of codes — with LayerNorm applied afterward to re-center and rescale before the
+output head.
+
+Key Configuration
+-----------------
+  SEED: controlled via SEED env var (default 1001); EVAL_SEED=12345 (fixed)
+  EMB_DIM=128, BATCH_SIZE=256, LR=1e-3, WEIGHT_DECAY=0.0
+  EPOCHS_STAGE1=10, EPOCHS_STAGE2=10
+  PREFIX_LEN=4, MAX_CODES_PER_ADMISSION=256, DX_CHUNKSIZE=2_000_000
+  NHSIC_SUBSAMPLE=5000, RBF_SCALES=[0.25, 0.50, 1.00, 2.00, 4.00]
+  WEIGHT_EPS=0.02, WEIGHT_ALPHA=0.25, WEIGHT_CAP=3.0
+
+Expected Directory Layout
+--------------------------
+    <data_root>/
+    └── core/
+        ├── admissions_core_train.csv
+        ├── admissions_core_val.csv
+        ├── admissions_core_test.csv
+        ├── diagnoses_icd9_core_train.csv.gz
+        ├── diagnoses_icd9_core_val.csv.gz
+        └── diagnoses_icd9_core_test.csv.gz
+
+Required admission columns:
+    hadm_id, mortality, mortality_30d, long_stay, long_stay_defined, icu_transfer
+
+Required diagnosis columns:
+    hadm_id, icd_code
+
+Dependencies
+------------
+    pip install numpy pandas scipy scikit-learn dcor torch
+
+Running
+-------
+    python deepsets_weighted_sum_nhsic_multi_rbf_mimiciii.py --data_root /path/to/final_datasets
+
+With optional arguments:
+    python deepsets_weighted_sum_nhsic_multi_rbf_mimiciii.py \\
+        --data_root /path/to/final_datasets \\
+        --validity_mode intersection
+
+Override training seed:
+    SEED=42 python deepsets_weighted_sum_nhsic_multi_rbf_mimiciii.py --data_root /path/to/final_datasets
+
+Example:
+    python deepsets_weighted_sum_nhsic_multi_rbf_mimiciii.py --data_root ./data/final_datasets
+"""
+
+import os
+import argparse
+import hashlib
+import random
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+import numpy as np
+import pandas as pd
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+from sklearn.feature_selection import mutual_info_classif
+from scipy.stats import pearsonr
+import dcor  # pip install dcor
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--data_root",
+        type=str,
+        required=True,
+        help="Path to final_datasets directory containing core/admissions_core_train.csv, etc.",
+    )
+    parser.add_argument(
+        "--validity_mode",
+        type=str,
+        default="taskwise",
+        choices=["taskwise", "intersection"],
+        help=(
+            "Validity convention for HSIC/NHSIC objectives. "
+            "'taskwise' uses each outcome's valid-label mask; "
+            "'intersection' uses admissions valid for all outcomes."
+        ),
+    )
+    return parser.parse_args()
+
+
+ARGS = parse_args()
+ROOT = Path(ARGS.data_root)
+VALIDITY_MODE = ARGS.validity_mode
+print("DATA_ROOT:", ROOT)
+print("VALIDITY_MODE for HSIC/NHSIC objectives:", VALIDITY_MODE)
+
+
+def orient_score_by_anchor(
+    score: np.ndarray,
+    Y: np.ndarray,
+    M: np.ndarray,
+    targets: List[str],
+    anchor: str = "mortality",
+) -> Tuple[int, float]:
+    """
+    Decide a SINGLE global flip (+1 or -1) so that higher score => higher risk for anchor.
+    Uses Pearson on the provided split (use VAL to avoid test leakage).
+    Returns (flip, anchor_corr_before_flip).
+    """
+    if anchor not in targets:
+        return +1, 0.0
+
+    j = targets.index(anchor)
+    corr = pearson_from_score(score, Y[:, j], M[:, j])
+
+    flip = -1 if corr < 0 else +1
+    return flip, float(corr)
+
+
+
+def stable_hash_mod(s: str, mod: int = 1000) -> int:
+    return int(hashlib.md5(s.encode("utf-8")).hexdigest(), 16) % mod
+
+
+# -------------------------
+# METRICS HELPERS
+# -------------------------
+def pearson_from_score(score: np.ndarray, y: np.ndarray, valid_mask: np.ndarray) -> float:
+    valid = valid_mask.astype(bool)
+    if valid.sum() < 3:
+        return 0.0
+    yy = y[valid].astype(float)
+    ss = score[valid].astype(float)
+    if np.std(ss) < 1e-8 or np.std(yy) < 1e-8:
+        return 0.0
+    corr, _ = pearsonr(ss, yy)
+    return float(corr)
+
+
+def dcor_from_score(score: np.ndarray, y: np.ndarray, valid_mask: np.ndarray) -> float:
+    valid = valid_mask.astype(bool)
+    if valid.sum() < 3:
+        return 0.0
+    yy = y[valid].astype(float)
+    ss = score[valid].astype(float)
+    return float(dcor.distance_correlation(ss, yy))
+
+
+# -------------------------
+# PATHS (FINAL DATASETS)
+# -------------------------
+DATASETS = {
+    "CORE": {
+        "train_adm": ROOT / "core" / "admissions_core_train.csv",
+        "val_adm":   ROOT / "core" / "admissions_core_val.csv",
+        "test_adm":  ROOT / "core" / "admissions_core_test.csv",
+        "train_dx":  ROOT / "core" / "diagnoses_icd9_core_train.csv.gz",
+        "val_dx":    ROOT / "core" / "diagnoses_icd9_core_val.csv.gz",
+        "test_dx":   ROOT / "core" / "diagnoses_icd9_core_test.csv.gz",
+        "train_targets": ["mortality", "mortality_30d", "long_stay", "icu_transfer"],
+        "eval_targets":  ["mortality", "mortality_30d", "long_stay", "icu_transfer"],
+    },
+
+}
+
+
+# -------------------------
+# CONFIG
+# -------------------------
+SEED = int(os.environ.get("SEED", 1001))   # training seed varies per run
+EVAL_SEED = 12345                        # fixed for val/test subsampling + MI
+print("SEED:", SEED, "| EVAL_SEED:", EVAL_SEED)
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+PREFIX_LEN = 4
+EMB_DIM = 128
+
+BATCH_SIZE = 256
+LR = 1e-3
+WEIGHT_DECAY = 0.0
+
+EPOCHS_STAGE1 = 10
+EPOCHS_STAGE2 = 10
+
+MAX_CODES_PER_ADMISSION = 256
+DX_CHUNKSIZE = 2_000_000
+
+# NHSIC
+NHSIC_SUBSAMPLE = 5000
+NHSIC_FLOOR = 1e-4
+EPS = 1e-8
+
+# Multi-RBF kernel scales (apples-to-apples with SetTransformer Multi-RBF)
+RBF_SCALES = [0.25, 0.50, 1.00, 2.00, 4.00]
+
+# MI
+MI_BASE_NEIGHBORS = 5
+
+
+# -------------------------
+# SEEDING
+# -------------------------
+def seed_all(seed: int = SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
+
+# -------------------------
+# APPLES-TO-APPLES: SKIP CHECK
+# -------------------------
+def is_single_class_train_from_df(df_tr: pd.DataFrame, target: str) -> bool:
+    """
+    Matches Single-RBF skip logic:
+      - if no valid rows -> skip
+      - if <2 unique labels among valid rows -> skip
+    long_stay validity handled via long_stay_defined.
+    """
+    if target == "long_stay":
+        if "long_stay_defined" not in df_tr.columns or "long_stay" not in df_tr.columns:
+            return True
+        valid = df_tr["long_stay_defined"].fillna(0).astype(int).to_numpy(dtype=bool)
+        yy = pd.to_numeric(df_tr["long_stay"], errors="coerce").fillna(0).astype(int).to_numpy()
+        yy = yy[valid]
+        if yy.size == 0:
+            return True
+        return np.unique(yy).size < 2
+
+    ycol = pd.to_numeric(df_tr[target], errors="coerce")
+    valid = ~ycol.isna()
+    if valid.sum() == 0:
+        return True
+    yy = ycol[valid].astype(int).to_numpy()
+    return np.unique(yy).size < 2
+
+
+# -------------------------
+# ICD PREFIX TOKENIZATION
+# -------------------------
+def norm_icd(code: str) -> str:
+    if pd.isna(code):
+        return ""
+    return str(code).upper().replace(".", "").replace(" ", "").strip()
+
+
+def icd_prefix(code_norm: str, k: int = PREFIX_LEN) -> str:
+    if not code_norm:
+        return ""
+    return code_norm[:k] if len(code_norm) >= k else code_norm
+
+
+# -------------------------
+# DIAGNOSES LOADING (KEEP DUPLICATES + ORDER)
+# -------------------------
+def build_vocab_from_dx(dx_path: Path) -> Dict[str, int]:
+    vocab = set()
+    for chunk in pd.read_csv(dx_path, usecols=["hadm_id", "icd_code"], chunksize=DX_CHUNKSIZE):
+        c = chunk["icd_code"].map(norm_icd).map(lambda s: icd_prefix(s, PREFIX_LEN))
+        c = c[c != ""]
+        vocab.update(c.unique().tolist())
+
+    vocab = sorted(vocab)
+    stoi = {"<PAD>": 0, "<UNK>": 1}
+    for i, tok in enumerate(vocab, start=2):
+        stoi[tok] = i
+    return stoi
+
+
+def build_hadm_to_tokens(dx_path: Path, stoi: Dict[str, int]) -> Dict[int, List[int]]:
+    hadm2toks: Dict[int, List[int]] = {}
+    for chunk in pd.read_csv(dx_path, usecols=["hadm_id", "icd_code"], chunksize=DX_CHUNKSIZE):
+        hadm = chunk["hadm_id"].to_numpy()
+        codes = chunk["icd_code"].to_numpy()
+        for h, raw in zip(hadm, codes):
+            try:
+                hid = int(h)
+            except Exception:
+                continue
+            cn = icd_prefix(norm_icd(raw), PREFIX_LEN)
+            if not cn:
+                continue
+            tid = stoi.get(cn, 1)  # UNK
+            lst = hadm2toks.get(hid)
+            if lst is None:
+                hadm2toks[hid] = [tid]
+            else:
+                lst.append(tid)
+
+    if MAX_CODES_PER_ADMISSION is not None:
+        for hid, lst in hadm2toks.items():
+            if len(lst) > MAX_CODES_PER_ADMISSION:
+                hadm2toks[hid] = lst[:MAX_CODES_PER_ADMISSION]
+    return hadm2toks
+
+
+# -------------------------
+# DATASET
+# -------------------------
+class AdmissionsSetDataset(Dataset):
+    def __init__(self, admissions_df: pd.DataFrame, hadm2toks: Dict[int, List[int]], targets: List[str]):
+        self.hadm_ids = admissions_df["hadm_id"].astype(int).to_numpy()
+        self.targets = targets
+        self.tokens = [hadm2toks.get(int(h), []) for h in self.hadm_ids]  # missing dx -> []
+
+        Y = admissions_df[targets].copy()
+        for t in targets:
+            Y[t] = pd.to_numeric(Y[t], errors="coerce")  # allow NaN
+
+        mask = (~Y.isna()).to_numpy(dtype=np.bool_)
+
+        # long_stay validity from long_stay_defined
+        if "long_stay" in targets:
+            if "long_stay_defined" not in admissions_df.columns:
+                raise ValueError("Expected long_stay_defined column for long_stay masking.")
+            j = targets.index("long_stay")
+            valid_ls = admissions_df["long_stay_defined"].fillna(0).astype(int).to_numpy().astype(bool)
+            mask[:, j] = valid_ls
+
+        self.mask = mask
+        self.y = Y.fillna(0).to_numpy(dtype=np.float32)
+
+    def __len__(self):
+        return len(self.hadm_ids)
+
+    def __getitem__(self, idx):
+        return self.tokens[idx], self.y[idx], self.mask[idx]
+
+
+def collate_batch(batch):
+    toks, y, m = zip(*batch)
+    lens = [len(x) for x in toks]
+    max_len = max(lens) if max(lens) > 0 else 1  # match single-RBF behavior
+
+    B = len(toks)
+    x = torch.zeros((B, max_len), dtype=torch.long)
+    pad_mask = torch.ones((B, max_len), dtype=torch.bool)  # True = PAD
+
+    for i, seq in enumerate(toks):
+        if len(seq) == 0:
+            continue
+        s = torch.tensor(seq, dtype=torch.long)
+        x[i, : len(seq)] = s
+        pad_mask[i, : len(seq)] = False
+
+    y = torch.tensor(np.asarray(y), dtype=torch.float32)
+    m = torch.tensor(np.asarray(m), dtype=torch.float32)
+    return x, pad_mask, y, m
+
+
+# -------------------------
+# DEEPSETS MODEL (ONE SCALAR)
+# -------------------------
+class DeepSetsSingleScalar(nn.Module):
+    def __init__(self, vocab_size: int, dim: int = EMB_DIM):
+        super().__init__()
+        self.emb = nn.Embedding(vocab_size, dim, padding_idx=0)
+
+        self.phi = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+        )
+
+        # ✅ add LayerNorm after pooling (matches B/C/D)
+        self.pool_ln = nn.LayerNorm(dim)
+
+        self.rho = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, 1),
+        )
+
+    def forward(self, x_tokens: torch.Tensor, pad_mask: torch.Tensor) -> torch.Tensor:
+        E = self.emb(x_tokens)          # (B, L, d)
+        H = self.phi(E)                 # (B, L, d)
+
+        keep = (~pad_mask).float().unsqueeze(-1)
+        H = H * keep
+        pooled = H.sum(dim=1)           # (B, d) masked SUM pooling
+
+        pooled = self.pool_ln(pooled)   # ✅ normalization step
+
+        s = self.rho(pooled).squeeze(-1)
+        return s
+
+
+# -------------------------
+# NHSIC (multi-RBF)
+# -------------------------
+def center_kernel(K: torch.Tensor) -> torch.Tensor:
+    mean_row = K.mean(dim=1, keepdim=True)
+    mean_col = K.mean(dim=0, keepdim=True)
+    mean_all = K.mean()
+    return K - mean_row - mean_col + mean_all
+
+def nhsic_kernel_alignment(K: torch.Tensor, L: torch.Tensor, eps: float = EPS) -> torch.Tensor:
+    Kc = center_kernel(K)
+    Lc = center_kernel(L)
+
+    num = (Kc * Lc).sum()
+    den = torch.sqrt((Kc * Kc).sum() * (Lc * Lc).sum()).clamp_min(eps)
+
+    return num / den
+
+
+
+
+def delta_kernel(y: torch.Tensor) -> torch.Tensor:
+    return (y.view(-1, 1) == y.view(1, -1)).float()
+
+
+def rbf_kernel_multi_1d(s: torch.Tensor, sigma_base: float) -> torch.Tensor:
+    s = s.view(-1, 1)
+    d2 = (s - s.t()).pow(2)
+    K_sum = 0.0
+    for a in RBF_SCALES:
+        sig = float(sigma_base) * float(a)
+        sig = max(sig, 1e-6)
+        K_sum = K_sum + torch.exp(-d2 / (2.0 * (sig ** 2) + EPS))
+    return K_sum / float(len(RBF_SCALES))
+
+
+def get_valid_mask_torch(
+    m_all: torch.Tensor,
+    task_idx: int,
+    mode: str = VALIDITY_MODE,
+) -> torch.Tensor:
+    if mode == "taskwise":
+        return m_all[:, task_idx] > 0.5
+    if mode == "intersection":
+        return (m_all > 0.5).all(dim=1)
+    raise ValueError(f"Unknown validity_mode: {mode}")
+
+
+def get_valid_mask_np(
+    M_all: np.ndarray,
+    task_idx: int,
+    mode: str = VALIDITY_MODE,
+) -> np.ndarray:
+    if mode == "taskwise":
+        return M_all[:, task_idx] > 0.5
+    if mode == "intersection":
+        return (M_all > 0.5).all(axis=1)
+    raise ValueError(f"Unknown validity_mode: {mode}")
+
+
+def nhsic_task_from_batch(
+    s: torch.Tensor,
+    y_task: torch.Tensor,
+    m_all: torch.Tensor,
+    sigma_base: float,
+    task_idx: int,
+    validity_mode: str = VALIDITY_MODE,
+) -> torch.Tensor:
+    valid = get_valid_mask_torch(m_all, task_idx, mode=validity_mode)
+
+    if valid.sum().item() < 3:
+        return s.sum() * 0.0
+
+    sv = s[valid]
+    yv = y_task[valid].to(torch.int64)
+
+    if torch.unique(yv).numel() < 2:
+        return s.sum() * 0.0
+
+    K = rbf_kernel_multi_1d(sv, sigma_base)
+    L = delta_kernel(yv)
+    return nhsic_kernel_alignment(K, L)
+
+
+
+# -------------------------
+# SIGMA ESTIMATION
+# -------------------------
+@torch.no_grad()
+def estimate_sigma_median(model: nn.Module, loader: DataLoader, n_samples: int = NHSIC_SUBSAMPLE) -> float:
+    """
+    Match Script B (SetTransformer multi-RBF) sigma estimation:
+      - Uses global NumPy RNG (np.random.choice) => controlled by np.random.seed(SEED)
+      - Samples k=min(N, n_samples) scores
+      - Computes FULL |si-sj| matrix
+      - Median over ALL nonzero entries (upper + lower triangle)
+    """
+    model.eval()
+    scores = []
+
+    for x, pad_mask, _y, _m in loader:
+        x = x.to(DEVICE)
+        pad_mask = pad_mask.to(DEVICE)
+        s = model(x, pad_mask).detach().float().cpu().numpy()
+        scores.append(s)
+        if sum(len(a) for a in scores) >= n_samples:
+            break
+
+    s_all = np.concatenate(scores, axis=0).astype(np.float64)
+    if s_all.size < 10:
+        return 1.0
+
+    k = int(min(s_all.size, n_samples))
+    idx = np.random.choice(s_all.size, size=k, replace=False)  # global RNG, like B
+    ss = s_all[idx]
+
+    d = np.abs(ss.reshape(-1, 1) - ss.reshape(1, -1))          # FULL matrix
+    nz = d[d > 0]                                              # all nonzero entries (duplicated distances included)
+
+    if nz.size == 0:
+        return 1.0
+
+    med = float(np.median(nz))
+    if (not np.isfinite(med)) or med <= 0:
+        return 1.0
+    return med
+
+
+def subsample_indices(valid_mask: np.ndarray, n: int, seed: int = EVAL_SEED) -> np.ndarray:
+    idx = np.where(valid_mask.astype(bool))[0]
+    if idx.size == 0:
+        return idx
+    if idx.size <= n:
+        return idx
+    rng = np.random.default_rng(seed)
+    return rng.choice(idx, size=n, replace=False)
+
+
+# -------------------------
+# SPLIT EVAL (NHSIC) WITH PER-TASK VALID SUBSAMPLE
+# -------------------------
+@torch.no_grad()
+def nhsic_on_split(
+    model: nn.Module,
+    loader: DataLoader,
+    targets: List[str],
+    sigma_base: float,
+    subsample: int = NHSIC_SUBSAMPLE,
+    seed: int = EVAL_SEED,
+    target_indices: Optional[List[int]] = None,
+) -> Dict[str, float]:
+    model.eval()
+    S, Y, M = [], [], []
+    for x, pad_mask, y, m in loader:
+        x = x.to(DEVICE)
+        pad_mask = pad_mask.to(DEVICE)
+        s = model(x, pad_mask).detach().float().cpu().numpy()
+        S.append(s)
+        Y.append(y.numpy())
+        M.append(m.numpy())
+    S = np.concatenate(S, axis=0).astype(np.float32)
+    Y = np.concatenate(Y, axis=0).astype(np.float32)
+    M = np.concatenate(M, axis=0).astype(np.float32)
+
+    out = {}
+    if target_indices is None:
+        target_indices = list(range(len(targets)))
+    if len(target_indices) != len(targets):
+        raise ValueError("target_indices must have the same length as targets")
+
+    for local_j, (t, j) in enumerate(zip(targets, target_indices)):
+        valid = get_valid_mask_np(M, j, mode=VALIDITY_MODE)
+        idx = subsample_indices(valid, subsample, seed=seed + local_j)
+        if idx.size < 3:
+            out[t] = 0.0
+            continue
+        yy = Y[idx, j].astype(np.int64)
+        if np.unique(yy).size < 2:
+            out[t] = 0.0
+            continue
+
+        sv = torch.tensor(S[idx], device=DEVICE, dtype=torch.float32)
+        yv = torch.tensor(yy, device=DEVICE, dtype=torch.int64)
+        K = rbf_kernel_multi_1d(sv, sigma_base)
+        L = delta_kernel(yv)
+        out[t] = float(nhsic_kernel_alignment(K, L).detach().cpu().item())
+
+    return out
+
+
+# -------------------------
+# MI (masked, MI_nats)
+# -------------------------
+def zscore_1d(x: np.ndarray) -> np.ndarray:
+    x = x.astype(np.float32)
+    return (x - x.mean()) / (x.std() + 1e-8)
+
+
+def mi_nats_masked(
+    score: np.ndarray,
+    Y: np.ndarray,
+    M: np.ndarray,
+    targets: List[str],
+    seed: int = EVAL_SEED,
+    base_neighbors: int = MI_BASE_NEIGHBORS,
+) -> Dict[str, float]:
+    out = {}
+    for j, t in enumerate(targets):
+        valid = M[:, j].astype(bool)
+        if valid.sum() < 3:
+            out[t] = 0.0
+            continue
+
+        yy = Y[valid, j].astype(int)
+        if np.unique(yy).size < 2:
+            out[t] = 0.0
+            continue
+
+        nn = int(min(base_neighbors, valid.sum() - 1))
+        if nn < 1:
+            out[t] = 0.0
+            continue
+
+        s_valid = zscore_1d(score[valid]).reshape(-1, 1)
+        out[t] = float(mutual_info_classif(s_valid, yy, random_state=seed, n_neighbors=nn)[0])
+    return out
+
+
+# -------------------------
+# TRAINING
+# -------------------------
+def train_single_task(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    task_idx: int,
+    task_name: str,
+    validation_anchor_idx: int,
+    validation_anchor_name: str,
+    sigma_base: float,
+) -> Tuple[Dict[str, torch.Tensor], float]:
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    best_state = None
+    best_val = -1e18
+
+    for _ep in range(1, EPOCHS_STAGE1 + 1):
+        model.train()
+        for x, pad_mask, y, m in train_loader:
+            x = x.to(DEVICE)
+            pad_mask = pad_mask.to(DEVICE)
+            y = y.to(DEVICE)
+            m = m.to(DEVICE)
+
+            s = model(x, pad_mask)
+            obj = nhsic_task_from_batch(s, y[:, task_idx], m, sigma_base, task_idx)
+            loss = -obj
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+        val_map = nhsic_on_split(
+            model,
+            val_loader,
+            [validation_anchor_name],
+            sigma_base,
+            subsample=NHSIC_SUBSAMPLE,
+            seed=EVAL_SEED + 1000 + task_idx,
+            target_indices=[validation_anchor_idx],
+        )
+        val_score = val_map[validation_anchor_name]
+
+        if val_score > best_val:
+            best_val = val_score
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state is None:
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    return best_state, float(best_val)
+
+
+def train_weighted_multitask(
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    train_targets: List[str],
+    weights: np.ndarray,
+    sigma_base: float,
+) -> Dict[str, torch.Tensor]:
+    opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    best_state = None
+    best_val = -1e18
+
+    w = torch.tensor(weights, device=DEVICE, dtype=torch.float32)
+
+    for _ep in range(1, EPOCHS_STAGE2 + 1):
+        model.train()
+        for x, pad_mask, y, m in train_loader:
+            x = x.to(DEVICE)
+            pad_mask = pad_mask.to(DEVICE)
+            y = y.to(DEVICE)
+            m = m.to(DEVICE)
+
+            s = model(x, pad_mask)
+
+            obj = torch.zeros((), device=DEVICE)
+            for j in range(len(train_targets)):
+                if w[j].item() == 0.0:
+                    continue
+                obj = obj + w[j] * nhsic_task_from_batch(s, y[:, j], m, sigma_base, j)
+
+            loss = -obj
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+
+        val_map = nhsic_on_split(
+            model,
+            val_loader,
+            train_targets,
+            sigma_base,
+            subsample=NHSIC_SUBSAMPLE,
+            seed=EVAL_SEED + 9999,
+        )
+        val_score = 0.0
+        for j, t in enumerate(train_targets):
+            val_score += float(weights[j]) * float(val_map[t])
+
+        if val_score > best_val:
+            best_val = val_score
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state is None:
+        best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    return best_state
+
+
+@torch.no_grad()
+def scores_and_labels(model: nn.Module, loader: DataLoader) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    model.eval()
+    S, Y, M = [], [], []
+    for x, pad_mask, y, m in loader:
+        x = x.to(DEVICE)
+        pad_mask = pad_mask.to(DEVICE)
+        s = model(x, pad_mask).detach().float().cpu().numpy()
+        S.append(s)
+        Y.append(y.numpy())
+        M.append(m.numpy())
+    return (
+        np.concatenate(S, axis=0).astype(np.float32),
+        np.concatenate(Y, axis=0).astype(np.float32),
+        np.concatenate(M, axis=0).astype(np.float32),
+    )
+
+
+# -------------------------
+# RUN ONE DATASET
+# -------------------------
+@torch.no_grad()
+def label_rates(df: pd.DataFrame, targets: List[str]) -> Dict[str, float]:
+    out = {}
+    for t in targets:
+        if t == "long_stay":
+            valid = df["long_stay_defined"].fillna(0).astype(int).to_numpy().astype(bool)
+            y = df["long_stay"].fillna(0).astype(float).to_numpy()
+            out[t] = float(y[valid].mean()) if valid.sum() > 0 else 0.0
+        else:
+            y = pd.to_numeric(df[t], errors="coerce")
+            valid = (~y.isna()).to_numpy()
+            out[t] = float(y[valid].fillna(0).mean()) if valid.sum() > 0 else 0.0
+    return out
+
+
+def run_dataset(name: str):
+    cfg = DATASETS[name]
+
+    print("\n" + "=" * 100)
+    print(f"DATASET: {name}")
+    print("=" * 100)
+
+    df_tr = pd.read_csv(cfg["train_adm"])
+    df_va = pd.read_csv(cfg["val_adm"])
+    df_te = pd.read_csv(cfg["test_adm"])
+
+    train_targets = cfg["train_targets"]
+    eval_targets = cfg["eval_targets"]
+
+    print(f"\nTRAIN n={len(df_tr):,} | VAL n={len(df_va):,} | TEST n={len(df_te):,}")
+
+    tr_rates = label_rates(df_tr, train_targets)
+    te_rates = label_rates(df_te, eval_targets)
+
+    print("\nTRAIN label positive rates (valid-only):")
+    for t in train_targets:
+        print(f"  {t:16s}: {tr_rates[t]:.6f}")
+
+    print("\nTEST label positive rates (valid-only) [EVAL TARGETS]:")
+    for t in eval_targets:
+        print(f"  {t:16s}: {te_rates[t]:.6f}")
+
+    print("\nLoading diagnoses (chunked) + building TRAIN vocab...")
+    stoi = build_vocab_from_dx(cfg["train_dx"])
+    vocab_size = len(stoi)
+    print(f"Vocab size (TRAIN ICD9 prefixes): {vocab_size:,} (incl PAD/UNK)")
+
+    print("Building hadm->tokens for TRAIN/VAL/TEST...")
+    hadm2tr = build_hadm_to_tokens(cfg["train_dx"], stoi)
+    hadm2va = build_hadm_to_tokens(cfg["val_dx"], stoi)
+    hadm2te = build_hadm_to_tokens(cfg["test_dx"], stoi)
+
+    ds_tr = AdmissionsSetDataset(df_tr, hadm2tr, train_targets)
+    ds_va = AdmissionsSetDataset(df_va, hadm2va, train_targets)
+    ds_te = AdmissionsSetDataset(df_te, hadm2te, eval_targets)
+
+    dl_tr = DataLoader(ds_tr, batch_size=BATCH_SIZE, shuffle=True,  num_workers=4, pin_memory=True, collate_fn=collate_batch)
+    dl_va = DataLoader(ds_va, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, collate_fn=collate_batch)
+    dl_te = DataLoader(ds_te, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True, collate_fn=collate_batch)
+
+    # =========================
+    # Stage 1: single-task NHSIC models (with skip logic)
+    # =========================
+    validation_anchor_name = "mortality"
+    mortality_idx = train_targets.index(validation_anchor_name)
+    print(
+        "\n=== Stage 1: Single-task NHSIC models "
+        f"(checkpoint selection anchored to VAL {validation_anchor_name}) ==="
+    )
+    stage1_best = {}
+    stage1_val = {}
+    skipped = np.zeros(len(train_targets), dtype=bool)
+
+    for j, t in enumerate(train_targets):
+        if is_single_class_train_from_df(df_tr, t):
+            print(f"\n  Skipping single-task model for {t}: single-class (or no valid labels) in TRAIN")
+            stage1_best[t] = None
+            stage1_val[t] = 0.0
+            skipped[j] = True
+            continue
+
+        print(f"\n  Training single-task model for: {t}")
+        model = DeepSetsSingleScalar(vocab_size=vocab_size).to(DEVICE)
+        sigma = estimate_sigma_median(model, dl_tr, n_samples=NHSIC_SUBSAMPLE)
+        sigma = float(max(sigma, 1e-6))
+        best_state, best_val = train_single_task(
+            model, dl_tr, dl_va, j, t,
+            mortality_idx, validation_anchor_name, sigma,
+        )
+
+        stage1_best[t] = best_state
+        stage1_val[t] = best_val
+        print(f"    best VAL NHSIC vs {validation_anchor_name}: {best_val:.6f} (sigma={sigma:.6f})")
+
+    # weights with floor; zero out skipped tasks
+    vals = np.array([max(stage1_val[t], 0.0) for t in train_targets], dtype=np.float64)
+    max_h = float(vals.max()) if vals.size > 0 else 0.0
+
+    # --- safer weighting ---
+    eps = 0.02          # floor in "nhsic units" (try 0.01–0.05)
+    alpha = 0.25        # weaker than sqrt (sqrt=0.5)
+    w_cap = 3.0         # prevent domination
+
+    denom = np.maximum(vals, eps)
+    weights = (np.maximum(max_h, eps) / denom) ** alpha
+    weights = np.clip(weights, 1.0 / w_cap, w_cap).astype(np.float32)
+
+    # zero-out skipped tasks
+    for j, t in enumerate(train_targets):
+        if stage1_best[t] is None:
+            weights[j] = 0.0
+
+    # normalize so average weight ~ 1 over active tasks
+    active = weights > 0
+    if active.any():
+        weights[active] = weights[active] / weights[active].mean()
+
+
+    print("\nStage-1 VAL NHSIC and derived weights:")
+    for j, t in enumerate(train_targets):
+        tag = " (SKIPPED)" if skipped[j] else ""
+        print(f"  {t:16s}: val_NHSIC={float(stage1_val[t]):.6f} | w={float(weights[j]):.6f}{tag}")
+
+    # =========================
+    # Stage 2: weighted multi-task NHSIC
+    # =========================
+    print("\n=== Stage 2: Weighted-sum NHSIC multi-task model ===")
+    model = DeepSetsSingleScalar(vocab_size=vocab_size).to(DEVICE)
+    sigma2 = estimate_sigma_median(model, dl_tr, n_samples=NHSIC_SUBSAMPLE)
+
+    sigma2 = float(max(sigma2, 1e-6))
+
+    best_state2 = train_weighted_multitask(model, dl_tr, dl_va, train_targets, weights, sigma2)
+    model.load_state_dict(best_state2)
+    print(f"Stage-2 sigma_base={sigma2:.6f}")
+
+    # =========================
+    # ORIENT SCORE USING VAL ANCHOR (GLOBAL SIGN CONVENTION)
+    # =========================
+    score_va, Y_va, M_va = scores_and_labels(model, dl_va)
+    flip, corr_before = orient_score_by_anchor(score_va, Y_va, M_va, train_targets, anchor="mortality")
+    print(f"\nVAL score orientation (anchor='mortality'): pearson_before={corr_before:.6f} | flip={flip}")
+
+
+    # =========================
+    # TEST: NHSIC + MI_nats
+    # =========================
+    print("\n=== TEST EVALUATION (ONE score s(x)) ===")
+    score_te, Y_te, M_te = scores_and_labels(model, dl_te)
+    score_te = score_te * flip
+
+
+    print("\nTEST NHSIC (subsampled, masked) using Stage-2 score:")
+    nh_te = {}
+    for j, t in enumerate(eval_targets):
+        valid = get_valid_mask_np(M_te, j, mode=VALIDITY_MODE)
+        if valid.sum() < 3:
+            nh_te[t] = 0.0
+            print(f"  {t:16s} NHSIC={nh_te[t]:.6f}")
+            continue
+
+        seed_t = EVAL_SEED + 777 + stable_hash_mod(t, 1000)
+        idx = subsample_indices(valid, NHSIC_SUBSAMPLE, seed=seed_t)
+
+        if idx.size < 3:
+            nh_te[t] = 0.0
+            print(f"  {t:16s} NHSIC={nh_te[t]:.6f}")
+            continue
+
+        yy = Y_te[idx, j].astype(np.int64)
+        if np.unique(yy).size < 2:
+            nh_te[t] = 0.0
+            print(f"  {t:16s} NHSIC={nh_te[t]:.6f}")
+            continue
+
+        sv = torch.tensor(score_te[idx], device=DEVICE, dtype=torch.float32)
+        yv = torch.tensor(yy, device=DEVICE, dtype=torch.int64)
+        K = rbf_kernel_multi_1d(sv, sigma2)
+        L = delta_kernel(yv)
+        nh_te[t] = float(nhsic_kernel_alignment(K, L).detach().cpu().item())
+
+        print(f"  {t:16s} NHSIC={nh_te[t]:.6f}")
+
+    mi_te = mi_nats_masked(score_te, Y_te, M_te, eval_targets, seed=EVAL_SEED)
+    print("\nTEST Metrics (DistCorr, MI_nats) using Stage-2 score:")
+    for j, t in enumerate(eval_targets):
+        y_t = Y_te[:, j]
+        m_t = M_te[:, j]
+
+        pearson = pearson_from_score(score_te, y_t, m_t)
+        dcorr = dcor_from_score(score_te, y_t, m_t)
+        mi = mi_te[t]
+
+
+        print(
+            f"  {t:16s} DistCorr={dcorr:.6f} | MI_nats={mi:.6f}"
+        )
+
+    print("=" * 100)
+
+
+# -------------------------
+# MAIN
+# -------------------------
+if __name__ == "__main__":
+    seed_all(SEED)
+    for ds_name in ["CORE"]:
+        run_dataset(ds_name)
